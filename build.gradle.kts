@@ -18,6 +18,7 @@ dependencies {
     implementation("io.ktor:ktor-server-netty:2.3.5")
     implementation("io.ktor:ktor-server-content-negotiation:2.3.5")
     implementation("io.ktor:ktor-serialization-jackson:2.3.5")
+    implementation("io.ktor:ktor-server-sessions:2.3.5")
     // PDF generation
     implementation("org.apache.pdfbox:pdfbox:3.0.0")
 }

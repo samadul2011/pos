@@ -260,10 +260,20 @@ object PdfGenerator {
     }
 
     fun generateInvoicePath(invoiceNo: Long): String {
+        val dir = File("invoices")
+        if (dir.exists() && dir.isDirectory) {
+            val existingFile = dir.listFiles { _, name -> 
+                name.startsWith("invoice-$invoiceNo-") && name.endsWith(".pdf") 
+            }?.firstOrNull()
+            
+            if (existingFile != null) {
+                return existingFile.absolutePath
+            }
+        }
+
         val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
         val today = LocalDateTime.now().format(formatter)
         val fileName = "invoice-$invoiceNo-$today.pdf"
-        val dir = File("invoices")
         return File(dir, fileName).absolutePath
     }
 }

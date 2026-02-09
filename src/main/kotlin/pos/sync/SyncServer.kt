@@ -10,6 +10,7 @@ import io.ktor.server.routing.routing
 import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
+import io.ktor.server.sessions.*
 import io.ktor.http.*
 import pos.data.CustomerRepository
 import pos.data.DatabaseFactory
@@ -17,6 +18,8 @@ import pos.data.ProductRepository
 import pos.data.SaleLine
 import pos.data.SaleRepository
 import pos.data.ReportsRepository
+import pos.data.UserRepository
+import pos.data.UserRole
 import pos.data.mapRows
 import pos.data.useStatement
 import pos.utils.InvoiceData
@@ -36,11 +39,18 @@ data class SaleRequestByCode(
     val method: String = "CASH"
 )
 
+data class MobileSession(
+    val username: String,
+    val displayName: String,
+    val role: String
+)
+
 object SyncServer {
     private val productRepo = ProductRepository()
     private val saleRepo = SaleRepository()
     private val reportsRepo = ReportsRepository()
     private val customerRepo = CustomerRepository()
+    private val userRepo = UserRepository()
 
     private fun buildInvoiceData(saleId: Long): InvoiceData {
         val conn = DatabaseFactory.connection
@@ -141,6 +151,15 @@ object SyncServer {
             install(ContentNegotiation) {
                 jackson()
             }
+
+            install(Sessions) {
+                cookie<MobileSession>("POS_MOBILE_SESSION") {
+                    cookie.path = "/"
+                    cookie.httpOnly = true
+                    cookie.extensions["SameSite"] = "Lax"
+                }
+            }
+
             routing {
                 get("/health") {
                     call.respondText("OK")
@@ -150,7 +169,143 @@ object SyncServer {
                                         call.respondRedirect("/mobile", permanent = false)
                                 }
 
+                                // Mobile login (reuses desktop users)
+                                get("/mobile/login") {
+                                    val err = call.request.queryParameters["err"]
+                                    val html = """
+                                        <!doctype html>
+                                        <html lang="en">
+                                        <head>
+                                            <meta charset="utf-8" />
+                                            <meta name="viewport" content="width=device-width, initial-scale=1" />
+                                            <title>POS Mobile Login</title>
+                                            <style>
+                                                * { margin:0; padding:0; box-sizing:border-box; }
+                                                body {
+                                                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                                    min-height: 100vh;
+                                                    padding: 16px;
+                                                    display: flex;
+                                                    align-items: center;
+                                                    justify-content: center;
+                                                }
+                                                .card {
+                                                    width: 100%;
+                                                    max-width: 420px;
+                                                    background: white;
+                                                    border-radius: 16px;
+                                                    padding: 20px;
+                                                    box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+                                                }
+                                                h2 { margin-bottom: 6px; color:#333; }
+                                                p { color:#666; font-size:0.9em; margin-bottom: 16px; }
+                                                label { display:block; font-weight:600; color:#666; font-size:0.85em; margin: 10px 0 6px; }
+                                                input {
+                                                    width: 100%;
+                                                    padding: 12px;
+                                                    border: 1px solid #ddd;
+                                                    border-radius: 10px;
+                                                    font-size: 1em;
+                                                }
+                                                .btn {
+                                                    width: 100%;
+                                                    margin-top: 14px;
+                                                    border: none;
+                                                    padding: 12px;
+                                                    border-radius: 12px;
+                                                    font-weight: 700;
+                                                    color: white;
+                                                    background: #667eea;
+                                                    cursor: pointer;
+                                                }
+                                                .err {
+                                                    background: #ffebee;
+                                                    color: #c62828;
+                                                    padding: 10px 12px;
+                                                    border-radius: 12px;
+                                                    font-size: 0.9em;
+                                                    margin-bottom: 12px;
+                                                }
+                                            </style>
+                                        </head>
+                                        <body>
+                                            <div class="card">
+                                                <h2>POS Mobile</h2>
+                                                <p>Sign in using your POS username and password.</p>
+                                                ${if (!err.isNullOrBlank()) "<div class='err'>${err.replace("<","&lt;").replace(">","&gt;")}</div>" else ""}
+                                                <form method="post" action="/mobile/login">
+                                                    <label>Username</label>
+                                                    <input name="username" autocomplete="username" />
+                                                    <label>Password</label>
+                                                    <input name="password" type="password" autocomplete="current-password" />
+                                                    <button class="btn" type="submit">Sign in</button>
+                                                </form>
+                                            </div>
+                                        </body>
+                                        </html>
+                                    """.trimIndent()
+                                    call.respondText(html, ContentType.Text.Html)
+                                }
+
+                                post("/mobile/login") {
+                                    userRepo.ensureAdminAccount()
+                                    val params = call.receiveParameters()
+                                    val username = params["username"]?.trim().orEmpty()
+                                    val password = params["password"]?.trim().orEmpty()
+                                    if (username.isBlank() || password.isBlank()) {
+                                        call.respondRedirect("/mobile/login?err=Missing%20username%20or%20password", permanent = false)
+                                        return@post
+                                    }
+                                    val user = userRepo.authenticate(username, password)
+                                    if (user == null) {
+                                        call.respondRedirect("/mobile/login?err=Invalid%20username%20or%20password", permanent = false)
+                                        return@post
+                                    }
+                                    call.sessions.set(MobileSession(user.username, user.displayName, user.role.name))
+                                    call.respondRedirect("/mobile", permanent = false)
+                                }
+
+                                get("/mobile/logout") {
+                                    call.sessions.clear<MobileSession>()
+                                    call.respondRedirect("/mobile/login", permanent = false)
+                                }
+
+                                // Guard all mobile pages + mobile API endpoints
+                                intercept(ApplicationCallPipeline.Plugins) {
+                                    val path = call.request.path()
+                                    val session = call.sessions.get<MobileSession>()
+
+                                    val isMobileLogin = path == "/mobile/login"
+                                    val isMobileLogout = path == "/mobile/logout"
+                                    val isMobilePage = path == "/mobile" || path.startsWith("/mobile/")
+
+                                    val isApiEndpoint =
+                                        path == "/products" ||
+                                        path == "/customers" ||
+                                        path == "/sales" ||
+                                        path == "/salesByCode" ||
+                                        path.startsWith("/invoice/")
+
+                                    val needsAuth = (isMobilePage && !isMobileLogin && !isMobileLogout) || isApiEndpoint
+
+                                    if (needsAuth && session == null) {
+                                        if (isMobilePage) {
+                                            call.respondRedirect("/mobile/login", permanent = false)
+                                        } else {
+                                            call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Unauthorized"))
+                                        }
+                                        finish()
+                                    }
+                                }
+
                                 get("/mobile") {
+                                    val session = call.sessions.get<MobileSession>()!!
+                                    val createdByScope = if (session.role == UserRole.ADMIN.name) null else session.username
+                                    val labelPrefix = if (createdByScope == null) "All Sales" else "Your Sales"
+
+                                    val todayStats = reportsRepo.getStatsForPeriod("Today", createdByScope)
+                                    val monthStats = reportsRepo.getStatsForPeriod("This Month", createdByScope)
                                         val html = """
                                                 <!doctype html>
                                                 <html lang="en">
@@ -158,16 +313,158 @@ object SyncServer {
                                                     <meta charset="utf-8" />
                                                     <meta name="viewport" content="width=device-width, initial-scale=1" />
                                                     <title>POS Mobile</title>
+                                                    <style>
+                                                        * {
+                                                            margin: 0;
+                                                            padding: 0;
+                                                            box-sizing: border-box;
+                                                        }
+                                                        body {
+                                                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                                                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                                            min-height: 100vh;
+                                                            padding: 20px;
+                                                            color: #333;
+                                                        }
+                                                        .container {
+                                                            max-width: 600px;
+                                                            margin: 0 auto;
+                                                        }
+                                                        .header {
+                                                            text-align: center;
+                                                            color: white;
+                                                            margin-bottom: 30px;
+                                                        }
+                                                        .header h1 {
+                                                            font-size: 2em;
+                                                            font-weight: 700;
+                                                            margin-bottom: 8px;
+                                                        }
+                                                        .header p {
+                                                            opacity: 0.9;
+                                                            font-size: 0.95em;
+                                                        }
+                                                        .nav-grid {
+                                                            display: grid;
+                                                            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                                                            gap: 15px;
+                                                            margin-bottom: 20px;
+                                                        }
+                                                        .nav-card {
+                                                            background: white;
+                                                            border-radius: 16px;
+                                                            padding: 24px 16px;
+                                                            text-align: center;
+                                                            text-decoration: none;
+                                                            color: #333;
+                                                            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                                                            transition: all 0.3s ease;
+                                                            display: flex;
+                                                            flex-direction: column;
+                                                            align-items: center;
+                                                            gap: 8px;
+                                                        }
+                                                        .nav-card:active {
+                                                            transform: scale(0.98);
+                                                            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                                                        }
+                                                        .nav-card .icon {
+                                                            width: 48px;
+                                                            height: 48px;
+                                                            border-radius: 12px;
+                                                            display: flex;
+                                                            align-items: center;
+                                                            justify-content: center;
+                                                            font-size: 24px;
+                                                            margin-bottom: 4px;
+                                                        }
+                                                        .nav-card.primary .icon { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+                                                        .nav-card.success .icon { background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); }
+                                                        .nav-card.warning .icon { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
+                                                        .nav-card.info .icon { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
+                                                        .nav-card .title {
+                                                            font-weight: 600;
+                                                            font-size: 0.95em;
+                                                            color: #333;
+                                                        }
+                                                        .tip {
+                                                            background: rgba(255,255,255,0.2);
+                                                            backdrop-filter: blur(10px);
+                                                            border-radius: 12px;
+                                                            padding: 16px;
+                                                            color: white;
+                                                            text-align: center;
+                                                            font-size: 0.9em;
+                                                        }
+                                                        .stats {
+                                                            display: grid;
+                                                            grid-template-columns: 1fr 1fr;
+                                                            gap: 12px;
+                                                            margin: 16px 0 18px;
+                                                        }
+                                                        .stat {
+                                                            background: rgba(255,255,255,0.18);
+                                                            backdrop-filter: blur(10px);
+                                                            border-radius: 14px;
+                                                            padding: 12px;
+                                                            color: #fff;
+                                                            text-align: left;
+                                                        }
+                                                        .stat .k { font-size: 0.82em; opacity: 0.92; margin-bottom: 6px; }
+                                                        .stat .v { font-size: 1.25em; font-weight: 800; line-height: 1.1; }
+                                                        .stat .s { font-size: 0.82em; opacity: 0.92; margin-top: 6px; }
+                                                        .who {
+                                                            margin-top: 10px;
+                                                            font-size: 0.9em;
+                                                            opacity: 0.95;
+                                                        }
+                                                        .who a { color: #fff; text-decoration: underline; }
+                                                    </style>
                                                 </head>
                                                 <body>
-                                                    <h2>POS Mobile</h2>
-                                                    <p>
-                                                        <a href="/mobile/products">Products</a> |
-                                                        <a href="/mobile/product">Add/Update Product</a> |
-                                                        <a href="/mobile/sale">New Sale</a> |
-                                                        <a href="/mobile/invoices">Today Invoices</a>
-                                                    </p>
-                                                    <p>Tip: Bookmark this page on your phone.</p>
+                                                    <div class="container">
+                                                        <div class="header">
+                                                            <h1>📱 POS Mobile</h1>
+                                                            <p>Point of Sale System</p>
+                                                            <div class="who">Signed in: <b>${session.displayName.replace("<","&lt;").replace(">","&gt;")}</b> (${session.role}) · <a href="/mobile/logout">Logout</a></div>
+                                                        </div>
+
+                                                        <div class="stats">
+                                                            <div class="stat">
+                                                                <div class="k">${labelPrefix} · Today</div>
+                                                                <div class="v">${String.format("%.2f", todayStats.totalSales)}</div>
+                                                                <div class="s">Paid ${String.format("%.2f", todayStats.totalPaid)} · Bal ${String.format("%.2f", todayStats.totalBalance)} · ${todayStats.invoiceCount} invoices</div>
+                                                            </div>
+                                                            <div class="stat">
+                                                                <div class="k">${labelPrefix} · This Month</div>
+                                                                <div class="v">${String.format("%.2f", monthStats.totalSales)}</div>
+                                                                <div class="s">Paid ${String.format("%.2f", monthStats.totalPaid)} · Bal ${String.format("%.2f", monthStats.totalBalance)} · ${monthStats.invoiceCount} invoices</div>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        <div class="nav-grid">
+                                                            <a href="/mobile/products" class="nav-card primary">
+                                                                <div class="icon">📦</div>
+                                                                <div class="title">Products</div>
+                                                            </a>
+                                                            <a href="/mobile/product" class="nav-card success">
+                                                                <div class="icon">➕</div>
+                                                                <div class="title">Add Product</div>
+                                                            </a>
+                                                            <a href="/mobile/sale" class="nav-card warning">
+                                                                <div class="icon">🛒</div>
+                                                                <div class="title">New Sale</div>
+                                                            </a>
+                                                            <a href="/mobile/invoices" class="nav-card info">
+                                                                <div class="icon">📄</div>
+                                                                <div class="title">Invoices</div>
+                                                            </a>
+                                                        </div>
+                                                        
+                                                        <div class="tip">
+                                                            💡 Tip: Bookmark this page on your phone for quick access
+                                                        </div>
+                                                    </div>
                                                 </body>
                                                 </html>
                                         """.trimIndent()
@@ -205,28 +502,152 @@ object SyncServer {
                                 }
 
                                 get("/mobile/invoices") {
-                                        val sales = reportsRepo.dailySales()
-                                        val rows = sales.joinToString("\n") { s ->
-                                                val cust = (s.customerName ?: "Walk-in").replace("<", "&lt;").replace(">", "&gt;")
-                                                "<tr><td>#${s.id}</td><td>${cust}</td><td>${"%.2f".format(s.total)}</td><td>${"%.2f".format(s.paid)}</td><td>${s.createdAt}</td></tr>"
+                                        val session = call.sessions.get<MobileSession>()!!
+                                        val createdByScope = if (session.role == UserRole.ADMIN.name) null else session.username
+                                        val filter = call.request.queryParameters["filter"] ?: "all"
+                                        val sales = when (filter) {
+                                            "today" -> reportsRepo.dailySales(createdByScope)
+                                            "month" -> reportsRepo.monthlySales(createdByScope)
+                                            else -> reportsRepo.allSales(50, createdByScope)
                                         }
+                                        
+                                        val rows = if (sales.isEmpty()) {
+                                            "<tr><td colspan='5' style='text-align:center; padding:40px; color:#999;'>No invoices found</td></tr>"
+                                        } else {
+                                            sales.joinToString("\n") { s ->
+                                                val cust = (s.customerName ?: "Walk-in").replace("<", "&lt;").replace(">", "&gt;")
+                                                val statusColor = if (s.paid >= s.total) "#43A047" else "#E53935"
+                                                """<tr>
+                                                    <td><strong>#${s.id}</strong></td>
+                                                    <td>${cust}</td>
+                                                    <td style="text-align:right;">${"%.2f".format(s.total)}</td>
+                                                    <td style="text-align:right; color:${statusColor};">${"%.2f".format(s.paid)}</td>
+                                                    <td style="font-size:0.85em; color:#666;">${s.createdAt}</td>
+                                                </tr>"""
+                                            }
+                                        }
+                                        
                                         val html = """
                                                 <!doctype html>
                                                 <html lang="en">
                                                 <head>
                                                     <meta charset="utf-8" />
                                                     <meta name="viewport" content="width=device-width, initial-scale=1" />
-                                                    <title>Today Invoices</title>
+                                                    <title>Invoices</title>
+                                                    <style>
+                                                        * { margin: 0; padding: 0; box-sizing: border-box; }
+                                                        body {
+                                                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                                            min-height: 100vh;
+                                                            padding: 16px;
+                                                        }
+                                                        .container {
+                                                            max-width: 900px;
+                                                            margin: 0 auto;
+                                                            background: white;
+                                                            border-radius: 16px;
+                                                            padding: 20px;
+                                                            box-shadow: 0 8px 16px rgba(0,0,0,0.2);
+                                                        }
+                                                        .header {
+                                                            display: flex;
+                                                            justify-content: space-between;
+                                                            align-items: center;
+                                                            margin-bottom: 20px;
+                                                        }
+                                                        .back-btn {
+                                                            background: #667eea;
+                                                            color: white;
+                                                            padding: 8px 16px;
+                                                            border-radius: 8px;
+                                                            text-decoration: none;
+                                                            font-size: 0.9em;
+                                                        }
+                                                        h2 { color: #333; margin-bottom: 16px; }
+                                                        .filters {
+                                                            display: flex;
+                                                            gap: 8px;
+                                                            margin-bottom: 20px;
+                                                            flex-wrap: wrap;
+                                                        }
+                                                        .filter-btn {
+                                                            padding: 10px 20px;
+                                                            border-radius: 8px;
+                                                            text-decoration: none;
+                                                            font-weight: 600;
+                                                            font-size: 0.9em;
+                                                            transition: all 0.2s;
+                                                        }
+                                                        .filter-btn.active {
+                                                            background: #667eea;
+                                                            color: white;
+                                                        }
+                                                        .filter-btn:not(.active) {
+                                                            background: #f0f0f0;
+                                                            color: #666;
+                                                        }
+                                                        table {
+                                                            width: 100%;
+                                                            border-collapse: collapse;
+                                                            background: white;
+                                                        }
+                                                        th {
+                                                            background: #f8f9fa;
+                                                            padding: 12px;
+                                                            text-align: left;
+                                                            font-weight: 600;
+                                                            color: #333;
+                                                            border-bottom: 2px solid #dee2e6;
+                                                        }
+                                                        td {
+                                                            padding: 12px;
+                                                            border-bottom: 1px solid #f0f0f0;
+                                                        }
+                                                        tr:hover {
+                                                            background: #f8f9fa;
+                                                        }
+                                                        .count {
+                                                            color: #666;
+                                                            font-size: 0.9em;
+                                                            margin-bottom: 12px;
+                                                        }
+                                                        @media (max-width: 600px) {
+                                                            table { font-size: 0.85em; }
+                                                            th, td { padding: 8px 4px; }
+                                                        }
+                                                    </style>
                                                 </head>
                                                 <body>
-                                                    <p><a href="/mobile">← Back</a></p>
-                                                    <h3>Today Invoices</h3>
-                                                    <table border="1" cellpadding="6" cellspacing="0">
-                                                        <thead><tr><th>ID</th><th>Customer</th><th>Total</th><th>Paid</th><th>Time</th></tr></thead>
-                                                        <tbody>
-                                                            ${rows}
-                                                        </tbody>
-                                                    </table>
+                                                    <div class="container">
+                                                        <div class="header">
+                                                            <h2>📄 Invoices</h2>
+                                                            <a href="/mobile" class="back-btn">← Back</a>
+                                                        </div>
+                                                        
+                                                        <div class="filters">
+                                                            <a href="?filter=today" class="filter-btn ${if (filter == "today") "active" else ""}">Today</a>
+                                                            <a href="?filter=month" class="filter-btn ${if (filter == "month") "active" else ""}">This Month</a>
+                                                            <a href="?filter=all" class="filter-btn ${if (filter == "all") "active" else ""}">All</a>
+                                                        </div>
+                                                        
+                                                        <div class="count">Showing ${sales.size} invoice(s)</div>
+                                                        
+                                                        <table>
+                                                            <thead>
+                                                                <tr>
+                                                                    <th>ID</th>
+                                                                    <th>Customer</th>
+                                                                    <th style="text-align:right;">Total</th>
+                                                                    <th style="text-align:right;">Paid</th>
+                                                                    <th>Date</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                ${rows}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
                                                 </body>
                                                 </html>
                                         """.trimIndent()
@@ -240,119 +661,302 @@ object SyncServer {
                                                     <head>
                                                         <meta charset="utf-8" />
                                                         <meta name="viewport" content="width=device-width, initial-scale=1" />
-                                                        <title>Sales Invoice</title>
+                                                        <title>New Sale</title>
+                                                        <style>
+                                                            * { margin:0; padding:0; box-sizing:border-box; }
+                                                            body {
+                                                                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                                                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                                                min-height: 100vh;
+                                                                padding: 12px;
+                                                                color: #333;
+                                                            }
+                                                            .container { max-width: 600px; margin: 0 auto; }
+                                                            .header {
+                                                                display: flex;
+                                                                justify-content: space-between;
+                                                                align-items: center;
+                                                                margin-bottom: 20px;
+                                                                color: white;
+                                                            }
+                                                            .back-btn {
+                                                                color: white;
+                                                                text-decoration: none;
+                                                                background: rgba(255,255,255,0.2);
+                                                                padding: 6px 12px;
+                                                                border-radius: 8px;
+                                                                font-size: 0.9em;
+                                                            }
+                                                            .card {
+                                                                background: white;
+                                                                border-radius: 16px;
+                                                                padding: 16px;
+                                                                margin-bottom: 16px;
+                                                                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                                                            }
+                                                            .section-title {
+                                                                font-size: 1.1em;
+                                                                font-weight: 700;
+                                                                margin-bottom: 12px;
+                                                                color: #333;
+                                                                display: flex;
+                                                                align-items: center;
+                                                                gap: 8px;
+                                                            }
+                                                            .input-group { margin-bottom: 12px; }
+                                                            .input-group label {
+                                                                display: block;
+                                                                font-size: 0.85em;
+                                                                font-weight: 600;
+                                                                color: #666;
+                                                                margin-bottom: 4px;
+                                                            }
+                                                            input, select {
+                                                                width: 100%;
+                                                                padding: 10px;
+                                                                border: 1px solid #ddd;
+                                                                border-radius: 8px;
+                                                                font-size: 1em;
+                                                            }
+                                                            .table-container { overflow-x: auto; }
+                                                            table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+                                                            th { text-align: left; font-size: 0.8em; color: #999; padding: 4px; border-bottom: 1px solid #eee; }
+                                                            td { padding: 4px; vertical-align: middle; }
+                                                            .btn-add {
+                                                                background: #f0f0f0;
+                                                                border: none;
+                                                                padding: 8px 16px;
+                                                                border-radius: 8px;
+                                                                font-weight: 600;
+                                                                width: 100%;
+                                                                cursor: pointer;
+                                                            }
+                                                            .summary {
+                                                                border-top: 1px solid #eee;
+                                                                padding-top: 12px;
+                                                                margin-top: 12px;
+                                                            }
+                                                            .summary-row {
+                                                                display: flex;
+                                                                justify-content: space-between;
+                                                                margin-bottom: 4px;
+                                                                font-size: 0.95em;
+                                                            }
+                                                            .summary-row.total {
+                                                                font-size: 1.25em;
+                                                                font-weight: 700;
+                                                                color: #1976D2;
+                                                                margin-top: 8px;
+                                                            }
+                                                            .payment-grid {
+                                                                display: grid;
+                                                                grid-template-columns: repeat(2, 1fr);
+                                                                gap: 8px;
+                                                                margin-bottom: 12px;
+                                                            }
+                                                            .payment-btn {
+                                                                background: #f8f9fa;
+                                                                border: 2px solid transparent;
+                                                                border-radius: 12px;
+                                                                padding: 12px 8px;
+                                                                text-align: center;
+                                                                cursor: pointer;
+                                                                transition: all 0.2s;
+                                                            }
+                                                            .payment-btn.active {
+                                                                background: #e3f2fd;
+                                                                border-color: #1976D2;
+                                                            }
+                                                            .payment-btn .icon { font-size: 1.4em; margin-bottom: 4px; }
+                                                            .payment-btn .label { font-size: 0.85em; font-weight: 600; }
+                                                            
+                                                            .btn-save {
+                                                                background: #11998e;
+                                                                background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+                                                                color: white;
+                                                                border: none;
+                                                                width: 100%;
+                                                                padding: 14px;
+                                                                border-radius: 12px;
+                                                                font-size: 1.1em;
+                                                                font-weight: 700;
+                                                                cursor: pointer;
+                                                                box-shadow: 0 4px 12px rgba(56,239,125,0.3);
+                                                                margin-top: 12px;
+                                                            }
+                                                            .btn-save:active { transform: scale(0.98); }
+                                                            .remove-btn { color: #ff5252; border: none; background: none; font-size: 1.2em; cursor: pointer; }
+                                                            #result { margin-top: 12px; font-size: 0.85em; text-align: center; color: #666; }
+                                                        </style>
                                                     </head>
                                                     <body>
-                                                        <p><a href="/mobile">← Back</a></p>
-                                                        <h3>Sales Invoice</h3>
+                                                        <div class="container">
+                                                            <div class="header">
+                                                                <h2>🛒 New Sale</h2>
+                                                                <a href="/mobile" class="back-btn">← Back</a>
+                                                            </div>
 
-                                                        <div>
-                                                            <label>Customer (Phone)</label><br />
-                                                            <input id="customerPhone" list="customers" placeholder="Walk-in" />
-                                                            <datalist id="customers"></datalist>
-                                                            <div id="customerName" style="margin-top:4px;"></div>
+                                                            <div class="card">
+                                                                <div class="section-title">👤 Customer</div>
+                                                                <div class="input-group">
+                                                                    <input id="customerPhone" list="customers" placeholder="Phone / Walk-in" autocomplete="off" />
+                                                                    <datalist id="customers"></datalist>
+                                                                    <div id="customerName" style="margin-top:6px; font-size:0.85em; color:#1976D2; font-weight:600;"></div>
+                                                                </div>
+                                                            </div>
+
+                                                            <div class="card">
+                                                                <div class="section-title">📦 Items</div>
+                                                                <div class="table-container">
+                                                                    <table>
+                                                                        <thead>
+                                                                            <tr>
+                                                                                <th style="width:50%;">Product</th>
+                                                                                <th style="width:20%; text-align:right;">Qty</th>
+                                                                                <th style="width:30%; text-align:right;">Total</th>
+                                                                                <th></th>
+                                                                            </tr>
+                                                                        </thead>
+                                                                        <tbody id="lines"></tbody>
+                                                                    </table>
+                                                                </div>
+                                                                <button class="btn-add" onclick="addLine()">+ Add Product</button>
+                                                            </div>
+
+                                                            <div class="card">
+                                                                <div class="section-title">💳 Payment</div>
+                                                                <div class="payment-grid">
+                                                                    <div class="payment-btn" id="pay-CASH" onclick="selectMethod('CASH')">
+                                                                        <div class="icon">💵</div>
+                                                                        <div class="label">Cash</div>
+                                                                    </div>
+                                                                    <div class="payment-btn" id="pay-CREDIT" onclick="selectMethod('CREDIT')">
+                                                                        <div class="icon">📝</div>
+                                                                        <div class="label">Deo</div>
+                                                                    </div>
+                                                                    <div class="payment-btn" id="pay-MOBILE_BANKING" onclick="selectMethod('MOBILE_BANKING')">
+                                                                        <div class="icon">📱</div>
+                                                                        <div class="label">Mobile</div>
+                                                                    </div>
+                                                                    <div class="payment-btn" id="pay-CARD" onclick="selectMethod('CARD')">
+                                                                        <div class="icon">💳</div>
+                                                                        <div class="label">Card</div>
+                                                                    </div>
+                                                                </div>
+                                                                
+                                                                <div class="input-group">
+                                                                    <label>Paid Amount</label>
+                                                                    <input id="paid" type="number" step="0.01" value="0.00" oninput="onPaidChange()" />
+                                                                </div>
+
+                                                                <div class="summary">
+                                                                    <div class="summary-row"><span>Subtotal</span><span id="subtotal">0.00</span></div>
+                                                                    <div class="summary-row total"><span>Total</span><span id="total">0.00</span></div>
+                                                                    <div class="summary-row" style="margin-top:10px; color:#666;"><span id="balanceLabel">Balance Due</span><span id="balance">0.00</span></div>
+                                                                </div>
+                                                            </div>
+
+                                                            <button class="btn-save" onclick="saveSale()">Save & Share Invoice</button>
+                                                            <div id="result"></div>
                                                         </div>
 
-                                                        <div style="margin-top:10px;">
-                                                            <table border="1" cellpadding="6" cellspacing="0" style="width:100%; max-width:700px;">
-                                                                <thead>
-                                                                    <tr>
-                                                                        <th style="text-align:left;">Product</th>
-                                                                        <th style="text-align:right;">Qty</th>
-                                                                        <th style="text-align:right;">Price</th>
-                                                                        <th style="text-align:right;">Total</th>
-                                                                        <th></th>
-                                                                    </tr>
-                                                                </thead>
-                                                                <tbody id="lines"></tbody>
-                                                            </table>
-                                                            <button style="margin-top:8px;" onclick="addLine()">+ Add Item</button>
-                                                        </div>
-
-                                                        <div style="margin-top:10px; max-width:700px;">
-                                                            <div style="display:flex; justify-content:space-between;"><b>Subtotal</b><b id="subtotal">0.00</b></div>
-                                                            <div style="display:flex; justify-content:space-between;"><b>Total</b><b id="total">0.00</b></div>
-                                                        </div>
-
-                                                        <div style="margin-top:10px;">
-                                                            <label>Paid Amount</label><br />
-                                                            <input id="paid" value="0" />
-                                                        </div>
-
-                                                        <div style="margin-top:12px;">
-                                                            <button onclick="saveSale()">Save Invoice</button>
-                                                        </div>
-
-                                                        <pre id="result"></pre>
                                                         <datalist id="products"></datalist>
 
                                                         <script>
                                                             let products = [];
                                                             let customers = [];
+                                                            let currentMethod = 'CASH';
+                                                            let totalAmount = 0;
 
                                                             function money(n) {
-                                                                const v = Number(n || 0);
-                                                                return v.toFixed(2);
+                                                                return Number(n || 0).toFixed(2);
                                                             }
 
                                                             async function loadData() {
-                                                                const prodResp = await fetch('/products');
-                                                                products = await prodResp.json();
-                                                                const prodList = document.getElementById('products');
-                                                                prodList.innerHTML = '';
+                                                                const [pResp, cResp] = await Promise.all([fetch('/products'), fetch('/customers')]);
+                                                                if (pResp.status === 401 || cResp.status === 401) {
+                                                                    window.location.href = '/mobile/login';
+                                                                    return;
+                                                                }
+                                                                products = await pResp.json();
+                                                                customers = await cResp.json();
+                                                                
+                                                                const pList = document.getElementById('products');
                                                                 products.forEach(p => {
                                                                     const opt = document.createElement('option');
                                                                     opt.value = p.code;
-                                                                    opt.label = (p.description || '') + ' (Stock ' + money(p.stock) + ')';
-                                                                    prodList.appendChild(opt);
+                                                                    opt.label = p.description + ' (' + money(p.sellPrice) + ')';
+                                                                    pList.appendChild(opt);
                                                                 });
 
-                                                                const custResp = await fetch('/customers');
-                                                                customers = await custResp.json();
-                                                                const custList = document.getElementById('customers');
-                                                                custList.innerHTML = '';
+                                                                const cList = document.getElementById('customers');
                                                                 customers.forEach(c => {
                                                                     const opt = document.createElement('option');
                                                                     opt.value = c.phone;
                                                                     opt.label = c.name;
-                                                                    custList.appendChild(opt);
+                                                                    cList.appendChild(opt);
                                                                 });
-                                                            }
-
-                                                            function findProduct(code) {
-                                                                return products.find(p => (p.code || '').toLowerCase() === (code || '').toLowerCase());
                                                             }
 
                                                             function updateCustomerName() {
                                                                 const phone = document.getElementById('customerPhone').value.trim();
-                                                                const el = document.getElementById('customerName');
                                                                 const c = customers.find(x => x.phone === phone);
-                                                                el.textContent = c ? ('Name: ' + c.name) : (phone ? 'Name: (not found)' : '');
+                                                                document.getElementById('customerName').textContent = c ? 'Customer: ' + c.name : '';
+                                                            }
+
+                                                            function selectMethod(method) {
+                                                                currentMethod = method;
+                                                                document.querySelectorAll('.payment-btn').forEach(b => b.classList.remove('active'));
+                                                                document.getElementById('pay-' + method).classList.add('active');
+                                                                
+                                                                if (method !== 'CREDIT') {
+                                                                    document.getElementById('paid').value = money(totalAmount);
+                                                                } else {
+                                                                    document.getElementById('paid').value = "0.00";
+                                                                }
+                                                                updateBalance();
+                                                            }
+
+                                                            function onPaidChange() {
+                                                                updateBalance();
+                                                            }
+
+                                                            function updateBalance() {
+                                                                const paid = Number(document.getElementById('paid').value || 0);
+                                                                const balance = totalAmount - paid;
+                                                                const balEl = document.getElementById('balance');
+                                                                const labelEl = document.getElementById('balanceLabel');
+                                                                
+                                                                if (balance >= 0) {
+                                                                    labelEl.textContent = 'Balance Due';
+                                                                    balEl.textContent = money(balance);
+                                                                    balEl.style.color = balance > 0 ? '#E53935' : '#43A047';
+                                                                } else {
+                                                                    labelEl.textContent = 'Change';
+                                                                    balEl.textContent = money(Math.abs(balance));
+                                                                    balEl.style.color = '#43A047';
+                                                                }
                                                             }
 
                                                             function recalc() {
                                                                 let subtotal = 0;
                                                                 document.querySelectorAll('tr[data-line]').forEach(tr => {
-                                                                    const qty = Number(tr.querySelector('input[data-qty]').value || '0');
-                                                                    const price = Number(tr.querySelector('input[data-price]').value || '0');
+                                                                    const qty = Number(tr.querySelector('.qty').value || 0);
+                                                                    const code = tr.querySelector('.code-input').value.trim();
+                                                                    const p = products.find(x => x.code === code);
+                                                                    const price = p ? p.sellPrice : 0;
                                                                     const lineTotal = qty * price;
-                                                                    tr.querySelector('td[data-total]').textContent = money(lineTotal);
+                                                                    tr.querySelector('.line-total').textContent = money(lineTotal);
                                                                     subtotal += lineTotal;
                                                                 });
+                                                                totalAmount = subtotal;
                                                                 document.getElementById('subtotal').textContent = money(subtotal);
                                                                 document.getElementById('total').textContent = money(subtotal);
-                                                            }
-
-                                                            function onCodeChanged(tr) {
-                                                                const code = tr.querySelector('input[data-code]').value.trim();
-                                                                const p = findProduct(code);
-                                                                if (p) {
-                                                                    tr.querySelector('input[data-price]').value = money(p.sellPrice);
-                                                                    if (!tr.querySelector('input[data-qty]').value) {
-                                                                        tr.querySelector('input[data-qty]').value = '1';
-                                                                    }
+                                                                
+                                                                if (currentMethod !== 'CREDIT') {
+                                                                    document.getElementById('paid').value = money(subtotal);
                                                                 }
-                                                                recalc();
+                                                                updateBalance();
                                                             }
 
                                                             function addLine() {
@@ -360,75 +964,57 @@ object SyncServer {
                                                                 const tr = document.createElement('tr');
                                                                 tr.setAttribute('data-line', '1');
                                                                 tr.innerHTML = `
-                                                                    <td><input data-code list="products" placeholder="Code" style="width:120px;" /></td>
-                                                                    <td style="text-align:right;"><input data-qty value="1" style="width:60px; text-align:right;" /></td>
-                                                                    <td style="text-align:right;"><input data-price value="0" style="width:80px; text-align:right;" /></td>
-                                                                    <td data-total style="text-align:right;">0.00</td>
-                                                                    <td><button onclick="removeLine(this)">x</button></td>
+                                                                    <td><input class="code-input" list="products" placeholder="Code" /></td>
+                                                                    <td><input class="qty" type="number" value="1" style="text-align:right;" /></td>
+                                                                    <td class="line-total" style="text-align:right; font-weight:600;">0.00</td>
+                                                                    <td><button class="remove-btn" onclick="removeLine(this)">×</button></td>
                                                                 `;
                                                                 tbody.appendChild(tr);
-                                                                tr.querySelector('input[data-code]').addEventListener('input', () => onCodeChanged(tr));
-                                                                tr.querySelector('input[data-qty]').addEventListener('input', recalc);
-                                                                tr.querySelector('input[data-price]').addEventListener('input', recalc);
+                                                                tr.querySelector('.code-input').addEventListener('input', recalc);
+                                                                tr.querySelector('.qty').addEventListener('input', recalc);
                                                                 recalc();
                                                             }
 
                                                             function removeLine(btn) {
-                                                                const tr = btn.closest('tr');
-                                                                tr.parentNode.removeChild(tr);
+                                                                btn.closest('tr').remove();
                                                                 recalc();
                                                             }
 
                                                             async function saveSale() {
-                                                                const resultEl = document.getElementById('result');
-                                                                resultEl.textContent = 'Saving...';
-                                                                const customerPhone = document.getElementById('customerPhone').value.trim();
-                                                                const paid = Number(document.getElementById('paid').value || '0');
+                                                                const resEl = document.getElementById('result');
+                                                                resEl.textContent = '⌛ Saving invoice...';
                                                                 const lines = [];
-
                                                                 document.querySelectorAll('tr[data-line]').forEach(tr => {
-                                                                    const code = tr.querySelector('input[data-code]').value.trim();
-                                                                    const qty = Number(tr.querySelector('input[data-qty]').value || '0');
-                                                                    if (!code) return;
-                                                                    if (qty <= 0) return;
-                                                                    lines.push({ code: code, quantity: qty });
+                                                                    const code = tr.querySelector('.code-input').value.trim();
+                                                                    const qty = Number(tr.querySelector('.qty').value || 0);
+                                                                    if (code && qty > 0) lines.push({ code, quantity: qty });
                                                                 });
 
-                                                                if (lines.length === 0) {
-                                                                    resultEl.textContent = 'Add at least one item.';
-                                                                    return;
-                                                                }
+                                                                if (lines.length === 0) { resEl.textContent = '❌ Add items first!'; return; }
 
                                                                 try {
                                                                     const resp = await fetch('/salesByCode', {
                                                                         method: 'POST',
                                                                         headers: { 'Content-Type': 'application/json' },
-                                                                        body: JSON.stringify({ customerPhone: customerPhone || null, paid: paid, method: 'CASH', lines: lines })
+                                                                        body: JSON.stringify({
+                                                                            customerPhone: document.getElementById('customerPhone').value.trim() || null,
+                                                                            paid: Number(document.getElementById('paid').value || 0),
+                                                                            method: currentMethod,
+                                                                            lines: lines
+                                                                        })
                                                                     });
-
-                                                                    let body = null;
-                                                                    const text = await resp.text();
-                                                                    try { body = JSON.parse(text); } catch (_) { body = null; }
-
-                                                                    if (!resp.ok) {
-                                                                        resultEl.textContent = 'Error: ' + (body && body.error ? body.error : text);
-                                                                        return;
-                                                                    }
-                                                                    const id = body && body.id ? body.id : null;
-                                                                    if (!id) {
-                                                                        resultEl.textContent = 'Saved but no invoice id returned: ' + text;
-                                                                        return;
-                                                                    }
-                                                                    window.location.href = '/mobile/invoice/' + id;
+                                                                    const data = await resp.json();
+                                                                    if (!resp.ok) { throw new Error(data.error || 'Failed to save'); }
+                                                                    window.location.href = '/mobile/invoice/' + data.id;
                                                                 } catch (e) {
-                                                                    resultEl.textContent = 'Network error: ' + e;
+                                                                    resEl.textContent = '❌ Error: ' + e.message;
                                                                 }
                                                             }
 
                                                             document.getElementById('customerPhone').addEventListener('input', updateCustomerName);
                                                             loadData().then(() => {
+                                                                selectMethod('CASH');
                                                                 addLine();
-                                                                updateCustomerName();
                                                             });
                                                         </script>
                                                     </body>
@@ -519,7 +1105,7 @@ object SyncServer {
                                         val invoiceUrl = "${baseUrl}/mobile/invoice/${id}"
                                         val pdfUrl = "${baseUrl}/invoice/${id}/pdf"
                                         val waText = URLEncoder.encode(
-                                            "Invoice #${id} Total ${String.format("%.2f", data.total)}\n${invoiceUrl}\nPDF: ${pdfUrl}",
+                                            "Invoice #${id}\nTotal ${String.format("%.2f", data.total)}\nPaid ${String.format("%.2f", data.paidAmount)}\nMethod ${data.paymentMethod}\n${invoiceUrl}\nPDF: ${pdfUrl}",
                                             "UTF-8"
                                         )
                                         val waUrl = "https://wa.me/?text=${waText}"
@@ -545,6 +1131,7 @@ object SyncServer {
                                                         <div><b>Date:</b> ${data.date}</div>
                                                         <div><b>Customer:</b> ${data.customerName}</div>
                                                         <div><b>Phone:</b> ${data.customerPhone ?: "-"}</div>
+                                                        <div><b>Payment:</b> ${data.paymentMethod}</div>
                                                     </div>
 
                                                     <div style="margin-top:10px;">
@@ -598,12 +1185,14 @@ object SyncServer {
                 }
 
                 post("/sales") {
+                    val session = call.sessions.get<MobileSession>()!!
                     val req = call.receive<SaleRequest>()
-                    val id = saleRepo.createSale(req.customerPhone, req.lines, req.paid, req.method)
+                    val id = saleRepo.createSale(req.customerPhone, req.lines, req.paid, req.method, session.username)
                     call.respond(mapOf("id" to id))
                 }
 
                 post("/salesByCode") {
+                    val session = call.sessions.get<MobileSession>()!!
                     val req = call.receive<SaleRequestByCode>()
                     if (req.lines.isEmpty()) {
                             call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Sale must have at least one line"))
@@ -628,7 +1217,7 @@ object SyncServer {
                         }
 
                     try {
-                        val id = saleRepo.createSale(req.customerPhone, resolvedLines, req.paid, req.method)
+                        val id = saleRepo.createSale(req.customerPhone, resolvedLines, req.paid, req.method, session.username)
                         call.respond(mapOf("id" to id))
                     } catch (e: Exception) {
                             call.respond(HttpStatusCode.BadRequest, mapOf("error" to (e.message ?: "Failed to create sale")))

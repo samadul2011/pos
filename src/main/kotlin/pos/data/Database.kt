@@ -99,7 +99,41 @@ object DatabaseFactory {
                 );
                 """.trimIndent()
             )
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'CASHIER',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                """.trimIndent()
+            )
         }
+        ensureColumn("sales", "created_by", "created_by TEXT NOT NULL DEFAULT 'SYSTEM'")
+        ensureColumn("payments", "created_by", "created_by TEXT NOT NULL DEFAULT 'SYSTEM'")
+    }
+
+    private fun ensureColumn(table: String, columnName: String, columnDefinition: String) {
+        if (columnExists(table, columnName)) return
+        connection.createStatement().use { stmt ->
+            stmt.execute("ALTER TABLE $table ADD COLUMN $columnDefinition;")
+        }
+    }
+
+    private fun columnExists(table: String, columnName: String): Boolean {
+        connection.createStatement().use { stmt ->
+            stmt.executeQuery("PRAGMA table_info($table);").use { rs ->
+                while (rs.next()) {
+                    if (rs.getString("name").equals(columnName, ignoreCase = true)) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 }
 

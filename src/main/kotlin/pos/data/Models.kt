@@ -53,3 +53,56 @@ data class Product(
     val stock: Double = 0.0,
     val reorderLevel: Double = 0.0
 )
+
+data class ReportStats(
+    val totalSales: Double,
+    val totalPaid: Double,
+    val totalBalance: Double,
+    val invoiceCount: Int,
+    val cashSales: Double,
+    val creditSales: Double,
+    val mobileSales: Double,
+    val cardSales: Double
+)
+
+data class UserSalesSummary(
+    val username: String,
+    val displayName: String,
+    val totalSales: Double,
+    val totalPaid: Double,
+    val totalBalance: Double,
+    val invoiceCount: Int,
+    val cashSales: Double,
+    val creditSales: Double,
+    val mobileSales: Double,
+    val cardSales: Double
+)
+
+data class MonthlyStats(
+    val totalSales: Double,
+    val cashSales: Double,
+    val creditSales: Double,
+    val invoiceCount: Int,
+    val month: String
+)
+
+data class PaymentMethodSummary(
+    val method: String,
+    val totalAmount: Double,
+    val count: Int
+)
+
+enum class UserRole {
+    ADMIN,
+    CASHIER
+}
+
+data class User(
+    val id: Long? = null,
+    val username: String,
+    val passwordHash: String,
+    val displayName: String,
+    val role: UserRole = UserRole.CASHIER,
+    val createdAt: String? = null
+)
+

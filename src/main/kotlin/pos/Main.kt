@@ -7,6 +7,9 @@ import pos.data.ItemRepository
 import pos.data.CustomerRepository
 import pos.data.ReportsRepository
 import pos.data.ProductRepository
+import pos.data.User
+import pos.data.UserRepository
+import pos.data.UserRole
 import java.time.LocalDate
 import java.time.YearMonth
 import java.time.format.DateTimeFormatter
@@ -16,35 +19,43 @@ import androidx.compose.desktop.ui.tooling.preview.Preview
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.material.Button
+import androidx.compose.material.ButtonDefaults
 import androidx.compose.material.Card
 import androidx.compose.material.Divider
 import androidx.compose.material.MaterialTheme
 import androidx.compose.material.Surface
 import androidx.compose.material.Text
 import androidx.compose.material.TextField
+import androidx.compose.material.DropdownMenu
+import androidx.compose.material.DropdownMenuItem
+import androidx.compose.material.Shapes
+import androidx.compose.material.lightColors
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
-import androidx.compose.material.DropdownMenu
-import androidx.compose.material.DropdownMenuItem
-import androidx.compose.ui.window.Dialog
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 
 
 // ...existing code...
@@ -284,13 +295,46 @@ fun main() = application {
 
 @Composable
 fun App() {
+    val userRepo = remember {
+        UserRepository().apply {
+            ensureAdminAccount()
+        }
+    }
+    var currentUser by remember { mutableStateOf<User?>(null) }
+    var loginError by remember { mutableStateOf<String?>(null) }
+
+    if (currentUser == null) {
+        LoginScreen(
+            errorMessage = loginError,
+            onLogin = { username, password ->
+                val user = userRepo.authenticate(username, password)
+                if (user != null) {
+                    currentUser = user
+                    loginError = null
+                } else {
+                    loginError = "Invalid username or password"
+                }
+            }
+        )
+        return
+    }
+
+    val signedInUser = currentUser!!
+
     val itemRepo = remember { ItemRepository() }
     val saleRepo = remember { pos.data.SaleRepository() }
     val customerRepo = remember { CustomerRepository() }
     val productRepo = remember { ProductRepository() }
     val reportsRepo = remember { ReportsRepository() }
+    val adminScreens = remember { listOf("Dashboard", "POS", "Inventory", "Products", "Customers", "Reports", "Users") }
+    val cashierScreens = remember { listOf("POS", "Inventory", "Customers", "Reports") }
+    val availableScreens = if (signedInUser.role == UserRole.ADMIN) adminScreens else cashierScreens
+    var current by remember { mutableStateOf(availableScreens.first()) }
 
-    var current by remember { mutableStateOf("Dashboard") }
+    LaunchedEffect(signedInUser.username, availableScreens) {
+        current = availableScreens.first()
+    }
+
     var products by remember { mutableStateOf(productRepo.list()) }
     var customers by remember { mutableStateOf(customerRepo.list()) }
     val itemsCount by remember { mutableStateOf(itemRepo.list().size) }
@@ -303,32 +347,50 @@ fun App() {
         customers = customerRepo.list()
     }
 
-    MaterialTheme {
-        Row(modifier = Modifier.fillMaxSize()) {
-            NavigationRail(current = current, onSelect = { current = it })
-            Divider(modifier = Modifier.fillMaxHeight().width(1.dp))
-            Box(modifier = Modifier.fillMaxSize()) {
-                when (current) {
-                    "Dashboard" -> Dashboard(
-                        itemsCount = itemsCount,
-                        customersCount = customers.size,
-                        reportsRepo = reportsRepo,
-                        onNavigate = { current = it }
-                    )
+    PosTheme {
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colors.background) {
+            Row(modifier = Modifier.fillMaxSize()) {
+                NavigationRail(
+                    current = current,
+                    items = availableScreens,
+                    user = signedInUser,
+                    onSelect = { current = it },
+                    onLogout = {
+                        currentUser = null
+                        loginError = null
+                    }
+                )
+                Box(modifier = Modifier.fillMaxSize()) {
+                    when (current) {
+                        "Dashboard" -> Dashboard(
+                            itemsCount = itemsCount,
+                            customersCount = customers.size,
+                            reportsRepo = reportsRepo,
+                            onNavigate = { current = it },
+                            currentUser = signedInUser
+                        )
 
-                    "POS" -> POSScreen(itemRepo = itemRepo, saleRepo = saleRepo, onSave = { refreshProducts() })
+                        "POS" -> POSScreen(
+                            itemRepo = itemRepo,
+                            saleRepo = saleRepo,
+                            onSave = { refreshProducts() },
+                            currentUser = signedInUser
+                        )
 
-                    "Inventory" -> InventoryScreen(products = products, onRefresh = { refreshProducts() })
+                        "Inventory" -> InventoryScreen(products = products, onRefresh = { refreshProducts() })
 
-                    "Products" -> ProductsScreen(productRepo = productRepo, onUpdate = { refreshProducts() })
+                        "Products" -> ProductsScreen(productRepo = productRepo, onUpdate = { refreshProducts() })
 
-                    "Customers" -> CustomersScreen(customers = customers, onAdd = { newCustomer ->
-                        val saved = customerRepo.upsert(newCustomer)
-                        refreshCustomers()
-                        saved
-                    })
+                        "Customers" -> CustomersScreen(customers = customers, onAdd = { newCustomer ->
+                            val saved = customerRepo.upsert(newCustomer)
+                            refreshCustomers()
+                            saved
+                        })
 
-                    "Reports" -> ReportsScreen(reportsRepo)
+                        "Reports" -> ReportsScreen(reportsRepo = reportsRepo, currentUser = signedInUser)
+
+                        "Users" -> UserManagementScreen(userRepo = userRepo)
+                    }
                 }
             }
         }
@@ -336,23 +398,73 @@ fun App() {
 }
 
 @Composable
-private fun NavigationRail(current: String, onSelect: (String) -> Unit) {
-    val items = listOf("Dashboard", "POS", "Inventory", "Products", "Customers", "Reports")
-    Column(modifier = Modifier.width(180.dp).padding(16.dp), horizontalAlignment = Alignment.Start) {
-        items.forEach { label ->
-            val isActive = label == current
-            Button(onClick = { onSelect(label) }, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                Text(if (isActive) "• $label" else label)
+private fun NavigationRail(
+    current: String,
+    items: List<String>,
+    user: User,
+    onSelect: (String) -> Unit,
+    onLogout: () -> Unit
+) {
+    Card(
+        modifier = Modifier.width(240.dp).fillMaxHeight().padding(16.dp),
+        elevation = 6.dp,
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.fillMaxHeight().padding(16.dp), horizontalAlignment = Alignment.Start) {
+            Text("Welcome", style = MaterialTheme.typography.caption)
+            Text(user.displayName, style = MaterialTheme.typography.h6)
+            Text(user.role.name, style = MaterialTheme.typography.caption)
+            Spacer(modifier = Modifier.height(12.dp))
+            items.forEach { label ->
+                val isActive = label == current
+                Button(
+                    onClick = { onSelect(label) },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        backgroundColor = if (isActive) MaterialTheme.colors.primary else MaterialTheme.colors.surface,
+                        contentColor = if (isActive) MaterialTheme.colors.onPrimary else MaterialTheme.colors.onSurface
+                    )
+                ) {
+                    Text(if (isActive) "• $label" else label)
+                }
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            Button(onClick = onLogout, modifier = Modifier.fillMaxWidth()) {
+                Text("Logout")
             }
         }
     }
 }
 
 @Composable
-private fun Dashboard(itemsCount: Int, customersCount: Int, reportsRepo: ReportsRepository, onNavigate: (String) -> Unit) {
+private fun PosTheme(content: @Composable () -> Unit) {
+    val colors = lightColors(
+        background = Color(0xFFF6F7FB),
+        surface = Color.White
+    )
+    val shapes = Shapes(
+        small = RoundedCornerShape(10.dp),
+        medium = RoundedCornerShape(14.dp),
+        large = RoundedCornerShape(18.dp)
+    )
+
+    MaterialTheme(colors = colors, shapes = shapes) {
+        content()
+    }
+}
+
+@Composable
+private fun Dashboard(
+    itemsCount: Int,
+    customersCount: Int,
+    reportsRepo: ReportsRepository,
+    onNavigate: (String) -> Unit,
+    currentUser: User
+) {
     val todaySales by remember { mutableStateOf(reportsRepo.dailySales()) }
     Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Overview", style = MaterialTheme.typography.h5)
+        Text("Signed in as ${currentUser.displayName} (${currentUser.role.name})", style = MaterialTheme.typography.caption)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             StatCard(title = "Items", value = itemsCount.toString())
             StatCard(title = "Customers", value = customersCount.toString())
@@ -682,16 +794,295 @@ private fun CustomersScreen(customers: List<Customer>, onAdd: (Customer) -> Cust
 }
 
 @Composable
-private fun ReportsScreen(reportsRepo: ReportsRepository) {
-    val sales by remember { mutableStateOf(reportsRepo.dailySales()) }
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("Reports", style = MaterialTheme.typography.h5)
+private fun ReportsScreen(reportsRepo: ReportsRepository, currentUser: User) {
+    var filterOption by remember { mutableStateOf("Today") }
+    val createdByScope = remember(currentUser.username, currentUser.role) {
+        if (currentUser.role == UserRole.ADMIN) null else currentUser.username
+    }
+    val sales = remember(filterOption, createdByScope) {
+        when (filterOption) {
+            "Today" -> reportsRepo.dailySales(createdByScope)
+            "This Month" -> reportsRepo.monthlySales(createdByScope)
+            else -> reportsRepo.allSales(200, createdByScope)
+        }
+    }
+    val stats = remember(filterOption, currentUser.username) {
+        reportsRepo.getStatsForPeriod(filterOption, createdByScope)
+    }
+    val userCashTotal = remember(filterOption, currentUser.username) {
+        reportsRepo.cashTotalForUser(filterOption, currentUser.username)
+    }
+    val perUserSummaries = remember(filterOption, currentUser.role) {
+        if (currentUser.role == UserRole.ADMIN) reportsRepo.userSalesSummaries(filterOption) else emptyList()
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "Sales Reports",
+                style = MaterialTheme.typography.h4,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colors.primary
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("Today", "This Month", "All").forEach { option ->
+                    Button(
+                        onClick = { filterOption = option },
+                        colors = ButtonDefaults.buttonColors(
+                            backgroundColor = if (filterOption == option) MaterialTheme.colors.primary else MaterialTheme.colors.surface,
+                            contentColor = if (filterOption == option) MaterialTheme.colors.onPrimary else MaterialTheme.colors.onSurface
+                        )
+                    ) {
+                        Text(option)
+                    }
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("Financial Summary", style = MaterialTheme.typography.h6, fontWeight = FontWeight.SemiBold)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                EnhancedStatCard(
+                    title = "Total Sales",
+                    value = String.format("%.2f", stats.totalSales),
+                    subtitle = "${stats.invoiceCount} invoices",
+                    color = Color(0xFF1976D2),
+                    modifier = Modifier.weight(1f)
+                )
+                EnhancedStatCard(
+                    title = "Collected",
+                    value = String.format("%.2f", stats.totalPaid),
+                    color = Color(0xFF43A047),
+                    modifier = Modifier.weight(1f)
+                )
+                EnhancedStatCard(
+                    title = "Balance",
+                    value = String.format("%.2f", stats.totalBalance),
+                    color = Color(0xFFE53935),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("Payment Breakdown", style = MaterialTheme.typography.h6, fontWeight = FontWeight.SemiBold)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                EnhancedStatCard(
+                    title = "Cash",
+                    value = String.format("%.2f", stats.cashSales),
+                    color = Color(0xFF43A047),
+                    modifier = Modifier.weight(1f)
+                )
+                EnhancedStatCard(
+                    title = "Deo",
+                    value = String.format("%.2f", stats.creditSales),
+                    color = Color(0xFFE53935),
+                    modifier = Modifier.weight(1f)
+                )
+                EnhancedStatCard(
+                    title = "Mobile",
+                    value = String.format("%.2f", stats.mobileSales),
+                    color = Color(0xFF1976D2),
+                    modifier = Modifier.weight(1f)
+                )
+                EnhancedStatCard(
+                    title = "Card",
+                    value = String.format("%.2f", stats.cardSales),
+                    color = Color(0xFF7B1FA2),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Your cash activity", style = MaterialTheme.typography.h6, fontWeight = FontWeight.SemiBold)
+            EnhancedStatCard(
+                title = "Your Cash",
+                value = String.format("%.2f", userCashTotal),
+                subtitle = currentUser.displayName,
+                color = Color(0xFF2962FF),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        if (currentUser.role == UserRole.ADMIN) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Sales by User", style = MaterialTheme.typography.h6, fontWeight = FontWeight.SemiBold)
+                if (perUserSummaries.isEmpty()) {
+                    Text("No user sales found for $filterOption", color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f))
+                } else {
+                    perUserSummaries.forEach { summary ->
+                        Card(modifier = Modifier.fillMaxWidth(), elevation = 2.dp, shape = RoundedCornerShape(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(14.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(0.45f)) {
+                                    Text(summary.displayName, fontWeight = FontWeight.Bold)
+                                    Text(summary.username, style = MaterialTheme.typography.caption, color = MaterialTheme.colors.onSurface.copy(alpha = 0.65f))
+                                    Text("${summary.invoiceCount} invoices", style = MaterialTheme.typography.caption)
+                                }
+                                Column(modifier = Modifier.weight(0.55f), horizontalAlignment = Alignment.End) {
+                                    Text("Sales: ${String.format("%.2f", summary.totalSales)}", style = MaterialTheme.typography.body1, fontWeight = FontWeight.SemiBold)
+                                    Text("Paid: ${String.format("%.2f", summary.totalPaid)}", style = MaterialTheme.typography.caption)
+                                    Text("Bal: ${String.format("%.2f", summary.totalBalance)}", style = MaterialTheme.typography.caption)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text("Recent invoices", style = MaterialTheme.typography.h6, fontWeight = FontWeight.SemiBold)
+        if (sales.isEmpty()) {
+            Box(modifier = Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
+                Text("No invoices found for $filterOption", color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f))
+            }
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(sales) { sale ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        elevation = 3.dp,
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(0.5f)) {
+                                Text("Invoice #${sale.id}", style = MaterialTheme.typography.subtitle1, fontWeight = FontWeight.Bold)
+                                Text(sale.customerName ?: "Walk-in Customer", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f))
+                                Text(sale.createdAt, style = MaterialTheme.typography.caption, color = MaterialTheme.colors.onSurface.copy(alpha = 0.5f))
+                            }
+                            Column(
+                                modifier = Modifier.weight(0.3f),
+                                horizontalAlignment = Alignment.End
+                            ) {
+                                Text(String.format("%.2f", sale.total), style = MaterialTheme.typography.h6, fontWeight = FontWeight.Bold)
+                                Text(String.format("Paid: %.2f", sale.paid), style = MaterialTheme.typography.body2, color = if (sale.paid >= sale.total) Color(0xFF43A047) else Color(0xFFE53935))
+                            }
+                            Button(
+                                onClick = {
+                                    val pdfPath = pos.utils.PdfGenerator.generateInvoicePath(sale.id)
+                                    try {
+                                        Runtime.getRuntime().exec(arrayOf("cmd", "/c", "start", pdfPath))
+                                    } catch (e: Exception) {
+                                        println("Error opening PDF: ${e.message}")
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(backgroundColor = MaterialTheme.colors.secondary)
+                            ) {
+                                Text("Print", fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun UserManagementScreen(userRepo: UserRepository) {
+    var users by remember { mutableStateOf(userRepo.list()) }
+    var username by remember { mutableStateOf("") }
+    var displayName by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var role by remember { mutableStateOf(UserRole.CASHIER) }
+    var roleMenuExpanded by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var selectedUsername by remember { mutableStateOf<String?>(null) }
+
+    fun refresh() {
+        users = userRepo.list()
+    }
+
+    fun loadUser(user: User) {
+        selectedUsername = user.username
+        username = user.username
+        displayName = user.displayName
+        role = user.role
+        password = ""
+        message = null
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text("User Management", style = MaterialTheme.typography.h5)
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                TextField(value = username, onValueChange = { username = it }, label = { Text("Username") }, singleLine = true)
+                TextField(value = displayName, onValueChange = { displayName = it }, label = { Text("Display Name") }, singleLine = true)
+                TextField(value = password, onValueChange = { password = it }, label = { Text("Password") }, singleLine = true, visualTransformation = PasswordVisualTransformation())
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Role:", modifier = Modifier.padding(end = 8.dp))
+                    Box {
+                        Button(onClick = { roleMenuExpanded = true }) { Text(role.name) }
+                        DropdownMenu(expanded = roleMenuExpanded, onDismissRequest = { roleMenuExpanded = false }) {
+                            UserRole.values().forEach { candidate ->
+                                DropdownMenuItem(onClick = {
+                                    role = candidate
+                                    roleMenuExpanded = false
+                                }) {
+                                    Text(candidate.name)
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(onClick = {
+                        try {
+                            userRepo.saveUser(username, displayName.ifBlank { username }, role, password.ifBlank { null })
+                            refresh()
+                            message = "Saved ${username.trim()}"
+                            selectedUsername = null
+                            password = ""
+                        } catch (ex: Exception) {
+                            message = ex.message
+                        }
+                    }) {
+                        Text("Save")
+                    }
+                    Button(onClick = {
+                        username = ""
+                        displayName = ""
+                        password = ""
+                        selectedUsername = null
+                        message = null
+                    }) {
+                        Text("Clear")
+                    }
+                }
+                message?.let { Text(it, color = MaterialTheme.colors.primary, style = MaterialTheme.typography.body2) }
+            }
+        }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(sales) { sale ->
-                Card { Row(modifier = Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Column { Text("Receipt #${sale.id}"); Text(sale.customerName ?: "Walk-in") }
-                    Column(horizontalAlignment = Alignment.End) { Text("Total: ${sale.total}"); Text("Paid: ${sale.paid}") }
-                } }
+            items(users) { user ->
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { loadUser(user) }
+                        .background(if (selectedUsername == user.username) MaterialTheme.colors.primary.copy(alpha = 0.1f) else MaterialTheme.colors.surface)
+                ) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column {
+                            Text(user.displayName, fontWeight = FontWeight.Bold)
+                            Text(user.username, style = MaterialTheme.typography.caption)
+                        }
+                        Text(user.role.name, style = MaterialTheme.typography.body2)
+                    }
+                }
             }
         }
     }
@@ -703,6 +1094,46 @@ private fun StatCard(title: String, value: String) {
         Column(modifier = Modifier.padding(12.dp)) {
             Text(title, style = MaterialTheme.typography.subtitle1)
             Text(value, style = MaterialTheme.typography.h5)
+        }
+    }
+}
+
+@Composable
+private fun EnhancedStatCard(
+    title: String,
+    value: String,
+    subtitle: String? = null,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.height(120.dp),
+        elevation = 4.dp,
+        shape = RoundedCornerShape(12.dp),
+        backgroundColor = color.copy(alpha = 0.1f)
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        color.copy(alpha = 0.15f),
+                        color.copy(alpha = 0.05f)
+                    )
+                )
+            )
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize().padding(16.dp),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(title, style = MaterialTheme.typography.subtitle2, color = color.copy(alpha = 0.8f), fontWeight = FontWeight.Medium)
+                Column {
+                    Text(value, style = MaterialTheme.typography.h4, color = color, fontWeight = FontWeight.Bold)
+                    if (subtitle != null) {
+                        Text(subtitle, style = MaterialTheme.typography.caption, color = color.copy(alpha = 0.7f))
+                    }
+                }
+            }
         }
     }
 }
@@ -887,15 +1318,21 @@ private fun ProductsScreen(productRepo: ProductRepository, onUpdate: () -> Unit)
 }
 
 @Composable
-private fun POSScreen(itemRepo: pos.data.ItemRepository, saleRepo: pos.data.SaleRepository, onSave: () -> Unit) {
-    POSScreenWithDependencies(itemRepo, saleRepo, onSave)
+private fun POSScreen(
+    itemRepo: pos.data.ItemRepository,
+    saleRepo: pos.data.SaleRepository,
+    onSave: () -> Unit,
+    currentUser: User
+) {
+    POSScreenWithDependencies(itemRepo, saleRepo, onSave, currentUser)
 }
 
 @Composable
 private fun POSScreenWithDependencies(
     itemRepo: pos.data.ItemRepository,
     saleRepo: pos.data.SaleRepository,
-    onSave: () -> Unit
+    onSave: () -> Unit,
+    currentUser: User
 ) {
     val customerRepo = remember { pos.data.CustomerRepository() }
     val productRepo = remember { pos.data.ProductRepository() }
@@ -916,6 +1353,10 @@ private fun POSScreenWithDependencies(
     var showInvoiceHistory by remember { mutableStateOf(false) }
     var barcodeBuffer by remember { mutableStateOf("") }
     var lastBarcodeTime by remember { mutableStateOf(System.currentTimeMillis()) }
+
+    var paymentMethod by remember { mutableStateOf("CASH") }
+    var paidAmountText by remember { mutableStateOf("") }
+    var autoSetPaid by remember { mutableStateOf(true) }
 
     val customerPhoneFocus = remember { FocusRequester() }
     val productCodeFocus = remember { FocusRequester() }
@@ -1004,6 +1445,9 @@ private fun POSScreenWithDependencies(
                 )
             }
             val subtotal = items.sumOf { it.total }
+
+            val paidAmount = paidAmountText.toDoubleOrNull()
+                ?: if (paymentMethod == "CREDIT") 0.0 else subtotal
             val saleId = saleRepo.createSale(
                 selectedCustomer?.phone,
                 cart.values.map { (product, qty) ->
@@ -1013,8 +1457,9 @@ private fun POSScreenWithDependencies(
                         price = product.sellPrice
                     )
                 }.toList(),
-                subtotal,
-                "CASH"
+                paidAmount,
+                paymentMethod,
+                currentUser.username
             )
 
             val invoiceData = pos.utils.InvoiceData(
@@ -1026,8 +1471,8 @@ private fun POSScreenWithDependencies(
                 subtotal = subtotal,
                 tax = 0.0,
                 total = subtotal,
-                paidAmount = subtotal,
-                paymentMethod = "CASH"
+                paidAmount = paidAmount,
+                paymentMethod = paymentMethod
             )
 
             val pdfPath = pos.utils.PdfGenerator.generateInvoice(
@@ -1048,6 +1493,17 @@ private fun POSScreenWithDependencies(
 
             clearInvoice()
             onSave()
+        }
+    }
+
+    // Keep paid amount sensible by default, but allow partial payments.
+    val currentTotal = cart.values.sumOf { (product, qty) -> product.sellPrice * qty }
+    LaunchedEffect(currentTotal, paymentMethod) {
+        if (!autoSetPaid) return@LaunchedEffect
+        paidAmountText = if (paymentMethod == "CREDIT") {
+            "0.00"
+        } else {
+            String.format("%.2f", currentTotal)
         }
     }
 
@@ -1088,7 +1544,10 @@ private fun POSScreenWithDependencies(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Point of Sale - Invoice", style = MaterialTheme.typography.h5)
+            Column {
+                Text("Point of Sale - Invoice", style = MaterialTheme.typography.h5)
+                Text("Serving: ${currentUser.displayName}", style = MaterialTheme.typography.caption)
+            }
             Button(onClick = { showInvoiceHistory = !showInvoiceHistory }) {
                 Text(if (showInvoiceHistory) "Hide History" else "Show History")
             }
@@ -1132,158 +1591,226 @@ private fun POSScreenWithDependencies(
             Row(modifier = Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // Left Panel - Product Entry
                 Card(modifier = Modifier.weight(0.3f).fillMaxHeight(), elevation = 4.dp) {
-                    Column(modifier = Modifier.padding(12.dp).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Add Product", style = MaterialTheme.typography.h6)
-                        Divider()
-                        
-                        TextField(
-                            value = productCode,
-                            onValueChange = { 
-                                productCode = it
-                                productError = ""
-                            },
-                            label = { Text("Code / Barcode") },
-                            placeholder = { Text("Scan or type") },
+                    val leftScrollState = rememberScrollState()
+
+                    Column(modifier = Modifier.padding(12.dp).fillMaxHeight()) {
+                        Column(
                             modifier = Modifier
+                                .weight(1f)
                                 .fillMaxWidth()
-                                .focusRequester(productCodeFocus)
-                                .onFocusChanged { focus -> 
-                                    if (!focus.isFocused && productCode.isNotBlank()) {
-                                        lookupProduct()
+                                .verticalScroll(leftScrollState),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text("Add Product", style = MaterialTheme.typography.h6)
+                            Divider()
+
+                            TextField(
+                                value = productCode,
+                                onValueChange = {
+                                    productCode = it
+                                    productError = ""
+                                },
+                                label = { Text("Code / Barcode") },
+                                placeholder = { Text("Scan or type") },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .focusRequester(productCodeFocus)
+                                    .onFocusChanged { focus ->
+                                        if (!focus.isFocused && productCode.isNotBlank()) {
+                                            lookupProduct()
+                                        }
                                     }
-                                }
-                                .onKeyEvent { event ->
-                                    if (event.key == Key.Enter) {
-                                        val product = lookupProduct()
-                                        if (product != null) {
-                                            val qty = productQty.toDoubleOrNull() ?: product.defaultNumber.takeIf { it > 0 } ?: 1.0
-                                            addProductToCart(product, qty)
-                                            productCodeFocus.requestFocus()
-                                        }
-                                        true
-                                    } else false
-                                }
-                        )
-                        
-                        if (productDescription.isNotBlank()) {
-                            Card(modifier = Modifier.fillMaxWidth(), backgroundColor = androidx.compose.material.MaterialTheme.colors.primary.copy(alpha = 0.1f)) {
-                                Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text("Description:", style = MaterialTheme.typography.caption)
-                                    Text(productDescription, style = MaterialTheme.typography.body1)
-                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                        Column {
-                                            Text("Price:", style = MaterialTheme.typography.caption)
-                                            Text(productPrice, style = MaterialTheme.typography.h6)
-                                        }
-                                        Column(horizontalAlignment = Alignment.End) {
-                                            Text("Stock:", style = MaterialTheme.typography.caption)
-                                            Text(productStock, style = MaterialTheme.typography.h6)
+                                    .onKeyEvent { event ->
+                                        if (event.key == Key.Enter) {
+                                            val product = lookupProduct()
+                                            if (product != null) {
+                                                val qty = productQty.toDoubleOrNull()
+                                                    ?: product.defaultNumber.takeIf { it > 0 }
+                                                    ?: 1.0
+                                                addProductToCart(product, qty)
+                                                productCodeFocus.requestFocus()
+                                            }
+                                            true
+                                        } else false
+                                    }
+                            )
+
+                            if (productDescription.isNotBlank()) {
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    backgroundColor = MaterialTheme.colors.primary.copy(alpha = 0.1f)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text("Description:", style = MaterialTheme.typography.caption)
+                                        Text(productDescription, style = MaterialTheme.typography.body1)
+                                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                            Column {
+                                                Text("Price:", style = MaterialTheme.typography.caption)
+                                                Text(productPrice, style = MaterialTheme.typography.h6)
+                                            }
+                                            Column(horizontalAlignment = Alignment.End) {
+                                                Text("Stock:", style = MaterialTheme.typography.caption)
+                                                Text(productStock, style = MaterialTheme.typography.h6)
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        
-                        if (productError.isNotBlank()) {
-                            Card(modifier = Modifier.fillMaxWidth(), backgroundColor = androidx.compose.material.MaterialTheme.colors.error.copy(alpha = 0.1f)) {
-                                Text(
-                                    productError,
-                                    color = androidx.compose.material.MaterialTheme.colors.error,
-                                    style = MaterialTheme.typography.body2,
-                                    modifier = Modifier.padding(8.dp)
-                                )
-                            }
-                        }
-                        
-                        TextField(
-                            value = productQty,
-                            onValueChange = { productQty = it },
-                            label = { Text("Quantity") },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        
-                        Button(
-                            onClick = {
-                                if (productCode.isNotBlank()) {
-                                    val product = productRepo.findByCode(productCode.trim())
-                                    if (product != null) {
-                                        val qty = productQty.toDoubleOrNull() ?: 1.0
-                                        addProductToCart(product, qty)
-                                        productCodeFocus.requestFocus()
-                                    } else {
-                                        productError = "Product not found"
-                                    }
+
+                            if (productError.isNotBlank()) {
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    backgroundColor = MaterialTheme.colors.error.copy(alpha = 0.1f)
+                                ) {
+                                    Text(
+                                        productError,
+                                        color = MaterialTheme.colors.error,
+                                        style = MaterialTheme.typography.body2,
+                                        modifier = Modifier.padding(8.dp)
+                                    )
                                 }
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Add to Cart")
-                        }
+                            }
 
-                        Spacer(modifier = Modifier.weight(1f))
-
-                        // Summary Section
-                        Divider()
-                        val subtotal = cart.values.sumOf { (product, qty) -> product.sellPrice * qty }
-                        val itemCount = cart.values.sumOf { it.second }
-                        
-                        Text("Summary", style = MaterialTheme.typography.h6)
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Items:", style = MaterialTheme.typography.body2)
-                            Text(String.format("%.0f", itemCount), style = MaterialTheme.typography.body1)
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Subtotal:", style = MaterialTheme.typography.body2)
-                            Text(String.format("%.2f", subtotal), style = MaterialTheme.typography.h6)
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Tax:", style = MaterialTheme.typography.body2)
-                            Text("0.00", style = MaterialTheme.typography.body1)
-                        }
-                        Divider()
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("TOTAL:", style = MaterialTheme.typography.h6)
-                            Text(String.format("%.2f", subtotal), style = MaterialTheme.typography.h5)
-                        }
-
-                        Divider()
-                        
-                        // Action Buttons
-                        Button(
-                            onClick = { clearInvoice() },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = androidx.compose.material.ButtonDefaults.buttonColors(
-                                backgroundColor = androidx.compose.material.MaterialTheme.colors.secondary
+                            TextField(
+                                value = productQty,
+                                onValueChange = { productQty = it },
+                                label = { Text("Quantity") },
+                                modifier = Modifier.fillMaxWidth()
                             )
-                        ) {
-                            Text("Clear All")
-                        }
-                        
-                        Button(
-                            onClick = { saveAndPrintInvoice() },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = cart.isNotEmpty(),
-                            colors = androidx.compose.material.ButtonDefaults.buttonColors(
-                                backgroundColor = androidx.compose.material.MaterialTheme.colors.primary
-                            )
-                        ) {
-                            Text("Save & Print", style = MaterialTheme.typography.button)
-                        }
 
-                        if (lastSavedInvoiceId > 0) {
                             Button(
                                 onClick = {
-                                    val pdfPath = pos.utils.PdfGenerator.generateInvoicePath(lastSavedInvoiceId)
-                                    try {
-                                        val runtime = Runtime.getRuntime()
-                                        runtime.exec(arrayOf("cmd", "/c", "start", pdfPath))
-                                    } catch (e: Exception) {
-                                        println("Error opening PDF: ${e.message}")
+                                    if (productCode.isNotBlank()) {
+                                        val product = productRepo.findByCode(productCode.trim())
+                                        if (product != null) {
+                                            val qty = productQty.toDoubleOrNull() ?: 1.0
+                                            addProductToCart(product, qty)
+                                            productCodeFocus.requestFocus()
+                                        } else {
+                                            productError = "Product not found"
+                                        }
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("Reprint Last (#$lastSavedInvoiceId)")
+                                Text("Add to Cart")
+                            }
+
+                            // Summary Section
+                            Divider()
+                            val subtotal = currentTotal
+                            val itemCount = cart.values.sumOf { it.second }
+
+                            Text("Summary", style = MaterialTheme.typography.h6)
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("Items:", style = MaterialTheme.typography.body2)
+                                Text(String.format("%.0f", itemCount), style = MaterialTheme.typography.body1)
+                            }
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("TOTAL:", style = MaterialTheme.typography.h6)
+                                Text(String.format("%.2f", subtotal), style = MaterialTheme.typography.h5)
+                            }
+
+                            // Payment Section
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                backgroundColor = MaterialTheme.colors.primary.copy(alpha = 0.06f)
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text("Payment", style = MaterialTheme.typography.h6)
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        val options = listOf(
+                                            "CASH" to "Cash",
+                                            "MOBILE_BANKING" to "Mobile",
+                                            "CARD" to "Card",
+                                            "CREDIT" to "Deo"
+                                        )
+                                        options.forEach { (method, label) ->
+                                            val active = paymentMethod == method
+                                            Button(
+                                                onClick = {
+                                                    paymentMethod = method
+                                                    autoSetPaid = true
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                                colors = ButtonDefaults.buttonColors(
+                                                    backgroundColor = if (active) MaterialTheme.colors.primary else MaterialTheme.colors.surface,
+                                                    contentColor = if (active) MaterialTheme.colors.onPrimary else MaterialTheme.colors.onSurface
+                                                )
+                                            ) {
+                                                Text(label, fontSize = 12.sp)
+                                            }
+                                        }
+                                    }
+
+                                    TextField(
+                                        value = paidAmountText,
+                                        onValueChange = {
+                                            paidAmountText = it
+                                            autoSetPaid = false
+                                        },
+                                        label = { Text("Paid Amount") },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        singleLine = true
+                                    )
+
+                                    val paid = paidAmountText.toDoubleOrNull()
+                                        ?: if (paymentMethod == "CREDIT") 0.0 else subtotal
+                                    val balance = subtotal - paid
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                        Text(if (balance >= 0) "Balance:" else "Change:", style = MaterialTheme.typography.body2)
+                                        Text(String.format("%.2f", kotlin.math.abs(balance)), style = MaterialTheme.typography.body1)
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Action Buttons (always visible)
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { clearInvoice() },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(
+                                    backgroundColor = MaterialTheme.colors.secondary
+                                )
+                            ) {
+                                Text("Clear All")
+                            }
+
+                            Button(
+                                onClick = { saveAndPrintInvoice() },
+                                modifier = Modifier.fillMaxWidth(),
+                                enabled = cart.isNotEmpty(),
+                                colors = ButtonDefaults.buttonColors(
+                                    backgroundColor = MaterialTheme.colors.primary
+                                )
+                            ) {
+                                Text("Save & Print", style = MaterialTheme.typography.button)
+                            }
+
+                            if (lastSavedInvoiceId > 0) {
+                                Button(
+                                    onClick = {
+                                        val pdfPath = pos.utils.PdfGenerator.generateInvoicePath(lastSavedInvoiceId)
+                                        try {
+                                            val runtime = Runtime.getRuntime()
+                                            runtime.exec(arrayOf("cmd", "/c", "start", pdfPath))
+                                        } catch (e: Exception) {
+                                            println("Error opening PDF: ${e.message}")
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Reprint Last (#$lastSavedInvoiceId)")
+                                }
                             }
                         }
                     }
@@ -1440,6 +1967,47 @@ private fun InvoiceHistoryView(reportsRepo: ReportsRepository, onClose: () -> Un
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoginScreen(errorMessage: String?, onLogin: (String, String) -> Unit) {
+    var username by remember { mutableStateOf("admin") }
+    var password by remember { mutableStateOf("admin123") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Card(elevation = 8.dp, modifier = Modifier.widthIn(max = 360.dp)) {
+            Column(modifier = Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("POS Login", style = MaterialTheme.typography.h5)
+                Text("Sign in with your assigned credentials", style = MaterialTheme.typography.body2)
+                TextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("Username") },
+                    singleLine = true
+                )
+                TextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation()
+                )
+                if (!errorMessage.isNullOrBlank()) {
+                    Text(errorMessage, color = MaterialTheme.colors.error, style = MaterialTheme.typography.caption)
+                }
+                Button(onClick = { onLogin(username, password) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Sign in")
+                }
+                Text("Default admin: admin / admin123", style = MaterialTheme.typography.caption)
             }
         }
     }
